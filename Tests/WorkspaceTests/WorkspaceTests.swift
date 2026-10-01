@@ -3939,6 +3939,156 @@ final class WorkspaceTests: XCTestCase {
         }
     }
 
+    func testResolvedFileKeepsPinsWhenLocalPackageRenamed() async throws {
+        // Renaming a local package dependency must not drop existing pins: the
+        // renamed package's manifest is not in the workspace state yet, so the
+        // packages reachable only through it must not be treated as unrequired.
+        // See https://github.com/swiftlang/swift-package-manager/issues/10377
+        let sandbox = AbsolutePath("/tmp/ws/")
+        let fs = InMemoryFileSystem()
+
+        let workspace = try await MockWorkspace(
+            sandbox: sandbox,
+            fileSystem: fs,
+            roots: [
+                MockPackage(
+                    name: "Root",
+                    targets: [
+                        MockTarget(name: "Root", dependencies: ["One"]),
+                    ],
+                    products: [],
+                    dependencies: [
+                        .fileSystem(path: "./One"),
+                    ]
+                ),
+            ],
+            packages: [
+                MockPackage(
+                    name: "One",
+                    targets: [
+                        MockTarget(name: "One", dependencies: ["Baz"]),
+                    ],
+                    products: [
+                        MockProduct(name: "One", modules: ["One"]),
+                    ],
+                    dependencies: [
+                        .sourceControl(path: "./Baz", requirement: .exact("1.0.0")),
+                    ],
+                    versions: [nil]
+                ),
+                MockPackage(
+                    name: "Baz",
+                    targets: [
+                        MockTarget(name: "Baz"),
+                    ],
+                    products: [
+                        MockProduct(name: "Baz", modules: ["Baz"]),
+                    ],
+                    versions: ["1.0.0", "1.1.0"]
+                ),
+            ]
+        )
+
+        // Initial resolution pins Baz at 1.0.0.
+        try await workspace.checkPackageGraph(roots: ["Root"]) { graph, diagnostics in
+            XCTAssertNoDiagnostics(diagnostics)
+            PackageGraphTesterXCTest(graph) { result in
+                result.check(packages: "Baz", "One", "Root")
+            }
+        }
+        workspace.checkResolved { result in
+            result.check(dependency: "baz", at: .checkout(.version("1.0.0")))
+        }
+
+        // Rename the local package "One" to "Two" and widen its requirement on
+        // Baz, as if `mv one two` had been run and both manifests edited.
+        let onePath = workspace.packagesDir.appending("One")
+        let twoPath = workspace.packagesDir.appending("Two")
+        try fs.removeFileTree(onePath)
+        try fs.createDirectory(twoPath.appending(components: "Sources", "One"), recursive: true)
+        try fs.writeFileContents(twoPath.appending(components: "Sources", "One", "file.swift"), bytes: "")
+        // The manifest loader reads the tools version from the manifest file on
+        // disk before consulting the mocked manifests, so it must exist.
+        let toolsVersionSpecification = "// swift-tools-version: \(ToolsVersion.current.major).\(ToolsVersion.current.minor)"
+        try fs.writeFileContents(
+            twoPath.appending(component: "Package.swift"),
+            bytes: ByteString(encodingAsUTF8: toolsVersionSpecification)
+        )
+
+        // The renamed package is not in the workspace state, so register its
+        // manifest with the widened requirement directly.
+        let oneKey = MockManifestLoader.Key(url: onePath.pathString)
+        let twoKey = MockManifestLoader.Key(url: twoPath.pathString)
+        let oneManifest = workspace.manifestLoader.manifests[oneKey]!
+        let twoDependencies = oneManifest.dependencies.map { dependency -> PackageDependency in
+            guard case .sourceControl(let settings) = dependency else { return dependency }
+            return .sourceControl(
+                identity: settings.identity,
+                nameForTargetDependencyResolutionOnly: settings.nameForTargetDependencyResolutionOnly,
+                location: settings.location,
+                requirement: .range(.upToNextMajor(from: "1.0.0")),
+                productFilter: settings.productFilter
+            )
+        }
+        workspace.manifestLoader.manifests[twoKey] = Manifest.createManifest(
+            displayName: "Two",
+            path: twoPath,
+            packageKind: .fileSystem(twoPath),
+            packageIdentity: .plain("two"),
+            packageLocation: twoPath.pathString,
+            toolsVersion: oneManifest.toolsVersion,
+            dependencies: twoDependencies,
+            products: oneManifest.products,
+            targets: oneManifest.targets
+        )
+
+        // Point the root at the renamed package. The explicit name keeps the
+        // existing target dependency on product "One" resolving, the same as
+        // declaring `.package(name: "One", path: "./Two")` in the manifest.
+        let rootKey = MockManifestLoader.Key(url: sandbox.appending(components: "roots", "Root").pathString)
+        let rootManifest = workspace.manifestLoader.manifests[rootKey]!
+        let rootDependencies = rootManifest.dependencies.map { dependency -> PackageDependency in
+            guard case .fileSystem = dependency else { return dependency }
+            return .fileSystem(
+                identity: PackageIdentity(path: twoPath),
+                nameForTargetDependencyResolutionOnly: "One",
+                path: twoPath,
+                productFilter: .everything
+            )
+        }
+        workspace.manifestLoader.manifests[rootKey] = Manifest.createManifest(
+            displayName: rootManifest.displayName,
+            path: rootManifest.path,
+            packageKind: rootManifest.packageKind,
+            packageIdentity: rootManifest.packageIdentity,
+            packageLocation: rootManifest.packageLocation,
+            toolsVersion: rootManifest.toolsVersion,
+            dependencies: rootDependencies,
+            products: rootManifest.products,
+            targets: rootManifest.targets
+        )
+        // Rewrite the root manifest on disk as well so the resolved file's
+        // origin hash no longer matches and a full resolution runs, mirroring
+        // what `swift package resolve` does after the user edits the manifest.
+        let rootToolsVersionSpecification = "// swift-tools-version: \(ToolsVersion.current.major).\(ToolsVersion.current.minor)"
+        try fs.writeFileContents(
+            sandbox.appending(components: "roots", "Root", "Package.swift"),
+            bytes: ByteString(encodingAsUTF8: rootToolsVersionSpecification + "\n// local dependency renamed: one -> two\n")
+        )
+
+        // The pin on Baz must survive: the widened requirement still allows
+        // 1.0.0, and the existing pin is preferred over 1.1.0.
+        try await workspace.checkPackageGraph(roots: ["Root"]) { graph, diagnostics in
+            XCTAssertNoDiagnostics(diagnostics)
+            PackageGraphTesterXCTest(graph) { result in
+                result.check(packages: "Baz", "Two", "Root")
+            }
+        }
+        workspace.checkResolved { result in
+            result.check(dependency: "baz", at: .checkout(.version("1.0.0")))
+        }
+    }
+
     func testResolvedFileSchemeToolsVersion() async throws {
         for pair in [
             (ToolsVersion.v5_2, ToolsVersion.v5_2),

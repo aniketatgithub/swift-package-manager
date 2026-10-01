@@ -1051,6 +1051,11 @@ extension Workspace {
         else {
             return nil
         }
+        // When some manifests could not be loaded, the set of required dependencies is
+        // incomplete: packages reachable only through the missing manifests would wrongly
+        // appear unrequired. Do not drop their pins in that case; the pins are reconsidered
+        // once the full graph is available. See https://github.com/swiftlang/swift-package-manager/issues/10377
+        let canPruneUnrequiredPins = (try? dependencyManifests.missingPackages.isEmpty) ?? false
         for dependency in await self.state.dependencies.filter(\.packageRef.kind.isResolvable) {
             // a required dependency that is already loaded (managed) should be represented in the `Package.resolved` store.
             // also comparing location as it may have changed at this point
@@ -1059,7 +1064,7 @@ extension Workspace {
                 if resolvedPackagesStore.resolvedPackages[comparingLocation: dependency.packageRef] == .none {
                     resolvedPackagesStore.add(dependency)
                 }
-            } else if let pin = resolvedPackagesStore.resolvedPackages[dependency.packageRef.identity] {
+            } else if canPruneUnrequiredPins, let pin = resolvedPackagesStore.resolvedPackages[dependency.packageRef.identity] {
                 // otherwise, it should *not* be in the `Package.resolved` store.
                 resolvedPackagesStore.remove(pin)
             }
